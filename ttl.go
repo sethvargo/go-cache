@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"container/heap"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +16,10 @@ var _ Cache[string, string] = (*TTL[string, string])(nil)
 // are best for performance.
 type TTL[K comparable, V any] struct {
 	// cache represents the internal cache storage.
-	cache map[K]*ttlItem[K, V]
+	cache map[K]*ttlListItem[K, V]
 
-	// ttlHeap is a heap of TTL items.
-	heap ttlHeap[K, V]
+	// head points to the head of the linked list and tail points to the tail.
+	head, tail *ttlListItem[K, V]
 
 	// ttl is the global TTL value.
 	ttl time.Duration
@@ -45,8 +44,7 @@ func NewTTL[K comparable, V any](ttl time.Duration) *TTL[K, V] {
 	}
 
 	c := &TTL[K, V]{
-		cache:  make(map[K]*ttlItem[K, V], 16),
-		heap:   make([]*ttlItem[K, V], 0, 16),
+		cache:  make(map[K]*ttlListItem[K, V], 16),
 		ttl:    ttl,
 		stopCh: make(chan struct{}),
 	}
@@ -100,22 +98,26 @@ func (l *TTL[K, V]) set(key K, val V, now time.Time) {
 		panic("cache is stopped")
 	}
 
-	// Allow existing TTL item to be garbage collected.
-	if v, ok := l.cache[key]; ok {
-		var zeroV V
-		v.key = nil
-		v.value = zeroV
-		v.expiresAt = nil
+	node, ok := l.cache[key]
+	if !ok {
+		node = &ttlListItem[K, V]{
+			key: &key,
+		}
+		l.cache[key] = node
+	}
+	node.value = val
+	node.expiresAt = ptrTo(now.Add(l.ttl))
+
+	// If this is the first entry in the cache, update the head.
+	if l.head == nil {
+		l.head = node
 	}
 
-	item := &ttlItem[K, V]{
-		key:       &key,
-		value:     val,
-		expiresAt: ptrTo(now.Add(l.ttl)),
+	// This entry is new, so add it to the end of the list.
+	if l.tail != nil {
+		l.tail.next = node
 	}
-
-	l.cache[key] = item
-	heap.Push(&l.heap, item)
+	l.tail = node
 }
 
 // Fetch retrieves the cached value. If the value does not exist, the FetchFunc
@@ -165,11 +167,18 @@ func (l *TTL[K, V]) Stop() {
 	}
 	l.cache = nil
 
-	item := l.heap.Pop()
-	for item != nil {
-		item = l.heap.Pop()
+	var zeroK *K
+	var zeroV V
+
+	node := l.head
+	for node != nil {
+		node.key = zeroK
+		node.value = zeroV
+		node, node.next = node.next, nil
 	}
-	l.cache = nil
+
+	l.head = nil
+	l.tail = nil
 }
 
 // isStopped is a helper for checking if the queue is stopped.
@@ -200,65 +209,37 @@ func (l *TTL[K, V]) start(sweep time.Duration) {
 				l.lock.Lock()
 				defer l.lock.Unlock()
 
-				// Walk the heap to find the probable remaining times for sweep.
-				item := l.heap.Peek()
-				for item != nil && item.expiresAt.Before(now) {
-					_ = heap.Pop(&l.heap)
-					delete(l.cache, *item.key)
+				// Walk the LinkedList from the front, since those are the oldest items.
+				node := l.head
+				for node != nil {
+					// If this item isn't a candidate for expiration, then no future items
+					// will be a candidate either, since they are in increasing order.
+					if node.expiresAt.After(now) {
+						break
+					}
+
+					delete(l.cache, *node.key)
 
 					var zeroV V
-					item.key = nil
-					item.value = zeroV
-					item.expiresAt = nil
+					node.key = nil
+					node.value = zeroV
+					node.expiresAt = nil
+					node, node.next = node.next, nil
+				}
 
-					item = l.heap.Peek()
+				l.head = node
+				if node == nil {
+					l.tail = nil
 				}
 			}()
 		}
 	}
 }
 
-// ttlItem represents an entry in the linked list.
-type ttlItem[K comparable, V any] struct {
+// ttlListItem represents an entry in the linked list.
+type ttlListItem[K comparable, V any] struct {
+	next      *ttlListItem[K, V]
 	key       *K
 	value     V
 	expiresAt *time.Time
-}
-
-type ttlHeap[K comparable, V any] []*ttlItem[K, V]
-
-func (h ttlHeap[K, V]) Len() int {
-	return len(h)
-}
-
-func (h ttlHeap[K, V]) Less(i, j int) bool {
-	return h[i].expiresAt.Before(*h[j].expiresAt)
-}
-
-func (h ttlHeap[K, V]) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
-
-func (h *ttlHeap[K, V]) Push(item any) {
-	*h = append(*h, item.(*ttlItem[K, V]))
-}
-
-func (h *ttlHeap[K, V]) Pop() any {
-	if len(*h) == 0 {
-		return nil
-	}
-
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil
-	*h = old[0 : n-1]
-	return item
-}
-
-func (h ttlHeap[K, V]) Peek() *ttlItem[K, V] {
-	if len(h) > 0 {
-		return h[0]
-	}
-	return nil
 }

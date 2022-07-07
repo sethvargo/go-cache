@@ -19,7 +19,7 @@ func TestNewTTL(t *testing.T) {
 		if got, want := cache.ttl, 5*time.Minute; got != want {
 			t.Errorf("expected %d to be %d", got, want)
 		}
-		if got, want := cache.cache, make(map[string]*ttlItem[string, string], 10); !reflect.DeepEqual(got, want) {
+		if got, want := cache.cache, make(map[string]*ttlListItem[string, string], 10); !reflect.DeepEqual(got, want) {
 			t.Errorf("expected %#v to be %#v", got, want)
 		}
 	})
